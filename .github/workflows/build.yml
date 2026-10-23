@@ -1,0 +1,141 @@
+name: Build VLine Aim Reach Add-on
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Supports either a repository with source files at its root OR a repo
+      # where only the project ZIP has been uploaded. Only unpack our known
+      # Reach Add-on project; do not accidentally build an unrelated ZIP.
+      - name: Locate or extract the project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f build.gradle && -f settings.gradle ]]; then
+            echo "Gradle project found at repository root."
+          else
+            project_zip=""
+            # Prefer this exact new source package when older versions remain in the repo.
+            if [[ -f "vlineaim-reach-client-fix.zip" ]]; then
+              project_zip="vlineaim-reach-client-fix.zip"
+            else
+              shopt -s nullglob
+              for archive in ./*.zip; do
+                entries="$(unzip -Z1 "$archive" 2>/dev/null || true)"
+                if grep -Fxq 'build.gradle' <<< "$entries" \
+                  && grep -Fxq 'settings.gradle' <<< "$entries" \
+                  && grep -Fxq 'src/main/java/com/vlineaim/reach/VLineAimReachAddon.java' <<< "$entries" \
+                  && grep -Fxq 'src/client/java/com/vlineaim/reach/VLineAimReachClient.java' <<< "$entries"; then
+                  project_zip="$archive"
+                  break
+                fi
+              done
+            fi
+
+            if [[ -z "$project_zip" ]]; then
+              echo "::error::No Gradle source project found. The repository must contain build.gradle/settings.gradle at its root or the vlineaim-reach-addon project ZIP (not an unrelated ZIP)."
+              echo "Repository root contents:"
+              ls -la
+              exit 1
+            fi
+
+            echo "Extracting source project from: $project_zip"
+            temp_dir="$(mktemp -d)"
+            unzip -q "$project_zip" -d "$temp_dir"
+            cp -a "$temp_dir/build.gradle" "$temp_dir/settings.gradle" "$temp_dir/gradle.properties" "$temp_dir/src" ./
+            for item in reference README.md LICENSE; do
+              if [[ -e "$temp_dir/$item" ]]; then cp -a "$temp_dir/$item" ./; fi
+            done
+            rm -rf "$temp_dir"
+          fi
+
+      - name: Verify project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            build.gradle \
+            settings.gradle \
+            gradle.properties \
+            src/main/resources/fabric.mod.json \
+            src/main/java/com/vlineaim/reach/VLineAimReachAddon.java \
+            src/main/java/com/vlineaim/reach/ReachModifiers.java \
+            src/client/java/com/vlineaim/reach/VLineAimReachClient.java; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Required project file missing: $file"
+              exit 1
+            fi
+          done
+          echo "All required project files are present."
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.7.1'
+
+      - name: Build mod
+        run: gradle --no-daemon --no-configuration-cache clean build
+
+      - name: Prepare combined install bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Don't assume Gradle's archive filename; Loom/Gradle versions can
+          # change the produced filename. Ignore source and development JARs.
+          mapfile -t mod_jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-dev.jar' \
+            -print | sort)
+          if [[ ${#mod_jars[@]} -eq 0 ]]; then
+            echo "::error::No distributable mod JAR found in build/libs/."
+            echo "Files under build/libs:"
+            find build/libs -maxdepth 1 -type f -printf '%f\n' | sort || true
+            exit 1
+          fi
+
+          # Normally there is a single remapped mod JAR. If multiple are
+          # present, prefer the non-sources/non-dev JAR whose name does not
+          # include classifier suffixes, and report all candidates.
+          mod_jar="${mod_jars[0]}"
+          echo "Using mod JAR: $mod_jar"
+          cp "$mod_jar" dist/
+
+          if [[ -f reference/vlineaim-1.1.0-fast-fix.jar ]]; then
+            cp reference/vlineaim-1.1.0-fast-fix.jar dist/
+            echo "Included the VLine Aim reference JAR."
+          else
+            echo "::warning::Reference VLine Aim JAR not found; bundle will contain only the Reach add-on."
+          fi
+
+          (cd dist && zip -9 -r ../vlineaim-with-reach.zip .)
+          echo "Combined bundle contents:"
+          unzip -l vlineaim-with-reach.zip
+
+      - name: Upload mod JAR and combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlineaim-reach-client-fix-minecraft-26.1.2
+          path: |
+            build/libs/*.jar
+            vlineaim-with-reach.zip
+          if-no-files-found: error
+          retention-days: 14
